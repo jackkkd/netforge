@@ -1,0 +1,7 @@
+/build/
+/bin/
+*.log
+*.core
+core
+/.venv/
+__pycache__/
