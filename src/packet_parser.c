@@ -26,7 +26,7 @@ static uint16_t checksum(const unsigned char *bytes, size_t length)
 }
 
 static bool reject_packet(char *output, size_t capacity, const char *reason)
-{ (void)snprintf(output, capacity, "Rejected: %s", reason); return false; }
+{ (void)snprintf(output, capacity, "Rejected packet | Reason: %s", reason); return false; }
 
 /* Input starts at IPv4, not Ethernet. TCP/UDP checksums are not validated. */
 bool nf_packet_parse(const unsigned char *packet, size_t captured,
@@ -57,7 +57,9 @@ bool nf_packet_parse(const unsigned char *packet, size_t captured,
     if (!inet_ntop(AF_INET, packet + 12, source, sizeof source) ||
         !inet_ntop(AF_INET, packet + 16, destination, sizeof destination))
         return reject_packet(output, capacity, "cannot format IPv4 address");
-    (void)snprintf(output, capacity, "%s %-15s:%-5u -> %-15s:%-5u | %zu bytes",
+    (void)snprintf(output, capacity,
+         "Protocol: %s | Source IP: %s | Source port: %u\n"
+         "Destination IP: %s | Destination port: %u | IP bytes: %zu",
          protocol, source, (unsigned)be16(transport), destination,
          (unsigned)be16(transport + 2), total);
     return true;
@@ -94,7 +96,7 @@ static void *packet_worker(void *argument)
     uint32_t sequence = 0;
     bool failed = false;
     atomic_store(&job->state, NF_RUNNING);
-    nf_log_emit(NF_INFO, "SIM", "Simulation started. No network traffic is captured or transmitted.");
+    nf_log_emit(NF_INFO, "SIM", "Simulation started. These are generated examples, not captured traffic.");
     while (!atomic_load(&job->stop) && (!settings.limit || metrics.checked < settings.limit)) {
         unsigned char packet[60];
         char output[200];
@@ -157,10 +159,13 @@ int nf_packet_self_test(void)
     fprintf(stderr, "FAIL at line %d: %s\n", __LINE__, #test); } while (0)
     size_t size = nf_packet_build(packet, 2);
     CHECK(nf_packet_parse(packet, size, output, sizeof output));
-    CHECK(strstr(output, "TCP") && strstr(output, ":443"));
+    CHECK(strstr(output, "Protocol: TCP") && strstr(output, "Destination port: 443"));
+    CHECK(strstr(output, "Source IP: 192.0.2.3") && strstr(output, "Source port: 40002"));
+    CHECK(strstr(output, "Destination IP: 198.51.100.20") && strstr(output, "IP bytes: 40"));
     size = nf_packet_build(packet, 1);
     CHECK(nf_packet_parse(packet, size, output, sizeof output));
-    CHECK(strstr(output, "UDP") && strstr(output, ":53"));
+    CHECK(strstr(output, "Protocol: UDP") && strstr(output, "Destination port: 53"));
+    CHECK(strchr(output, '\n') != NULL);
     for (size_t i = 0; i < size; ++i) CHECK(!nf_packet_parse(packet, i, output, sizeof output));
     CHECK(!nf_packet_parse(NULL, 0, output, sizeof output));
     packet[8] ^= 1;

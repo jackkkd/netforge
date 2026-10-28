@@ -34,6 +34,22 @@ terminal to display a more detailed logo and a larger activity area.
 
 Skip the startup artwork with `./bin/netforge --no-splash`.
 
+At 42 terminal rows or more, the menu and tool screens expand with blank lines
+between settings and separate result sections. Field explanations appear beside
+the settings at 112 columns or more; while editing, the top hint describes the
+selected field. Content is centered and limited to 128 columns for readability.
+Smaller terminals use a compact layout. Returning to a stopped tool shows its
+finished/stopped status instead of leaving a stale "Stopping" message.
+
+<details>
+<summary>Readable packet and scanner screens</summary>
+
+![Packet stream and header parser](assets/ui-packets.png)
+
+![TCP port scanner](assets/ui-scanner.png)
+
+</details>
+
 ## Programs
 
 | Executable | Purpose |
@@ -138,6 +154,49 @@ For a demonstration, start HTTP first, visit its URL inside Kali, then start
 the default localhost scanner. It should find TCP port 8080 open. Start the
 packet simulation to show the parser alongside the other tools.
 
+## Reading recent activity
+
+Each entry starts with `[local time] [tool] [level]`. Tools are `SCAN`, `HTTP`,
+and `SIM` (simulated packet stream). Levels are `INFO`, `OK`, `WARN`, and `ERROR`.
+Activity is shared across running tools. Larger windows put a blank line between
+events; long lines wrap at word boundaries and continuation lines are indented.
+Labels remain part of each event when scrolling or saving the log.
+
+A parsed packet looks like this:
+
+```text
+[10:07:50] [SIM] [OK] Protocol: TCP | Source IP: 192.0.2.3 | Source port: 40002
+  Destination IP: 198.51.100.20 | Destination port: 443 | IP bytes: 40
+```
+
+| Label | Meaning |
+| --- | --- |
+| Protocol | Transport protocol in the example: TCP or UDP |
+| Source IP / Source port | Sender's IPv4 address and numbered transport endpoint |
+| Destination IP / Destination port | Receiver's IPv4 address and numbered transport endpoint |
+| IP bytes | Total IPv4 packet length, including headers and payload; excludes Ethernet |
+| Rejected packet / Reason | The parser could not accept the header; the reason explains why |
+
+Invalid examples are deliberately generated to demonstrate error checking.
+A warning about one of these simulated examples is not evidence of an attack.
+
+Scanner events identify what was tested and what happened:
+
+```text
+[10:08:00] [SCAN] [OK] Target IP: 127.0.0.1 | TCP port: 8080
+  State: OPEN | Reason: connection accepted
+```
+
+`Target IP` is the device checked; `TCP port` is its numbered endpoint. `OPEN`
+means the connection was accepted; `CLOSED` means it was refused. `UNCERTAIN`
+means a timeout or an unreachable/blocked connection prevented a clear answer.
+`Reason` records the observed result. The scanner does not identify applications
+or infer a service just from its port number.
+
+For HTTP, `Clients` counts connections and `Responses (200)` counts completed
+successful responses. A browser cannot connect while the server is `Ready` or
+`Stopped`: start it with Enter and wait for `Running` before opening the URL.
+
 ## Source layout
 
 ```text
@@ -154,6 +213,7 @@ src/
   net_io.c           Nonblocking socket helpers and cancellable polling
   net_io.h           Private networking helper declarations
   util.c             Time and numeric-input helpers
+  text.c             Word wrapping that preserves explicit event lines
 include/netforge/    Public module interfaces
 apps/
   scan_main.c        Standalone scanner entry point
@@ -207,10 +267,11 @@ The script refreshes the ASCII text files and `src/art_data.h`.
 make check
 ```
 
-This runs 41 parser/input checks and 37 integration checks. Integration tests
+This runs 44 parser/input checks and 45 integration checks. Integration tests
 use loopback connections and a real pseudo-terminal. They cover HTTP statuses,
 open/refused ports, conflicting listeners, worker cancellation, standalone
-executables, menu navigation, logo sizes, terminal resizing, and shutdown.
+executables, readable result labels, word wrapping, menu navigation, logo sizes,
+terminal resizing, and shutdown.
 Testing requires a normal Linux environment with working pseudo-terminals.
 
 For a strict warning build:
@@ -219,5 +280,5 @@ For a strict warning build:
 make CFLAGS='-O2 -std=c11 -Wall -Wextra -Wpedantic -Werror -MMD -MP'
 ```
 
-Verified on Linux with GCC 15.2.0 and ncurses 6.5: all 78 checks passed.
+Verified on Linux with GCC 15.2.0 and ncurses 6.5: all 89 checks passed.
 Kali is the intended deployment platform; build the sources inside your VM.

@@ -4,7 +4,7 @@ CPPFLAGS += -D_POSIX_C_SOURCE=200809L -Iinclude
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -MMD -MP
 NCURSES_LIBS ?= -lncurses
-CORE = job log util net_io scanner http_server packet_parser
+CORE = job log util text net_io scanner http_server packet_parser
 CORE_OBJS = $(addprefix build/,$(addsuffix .o,$(CORE)))
 PROGRAMS = bin/netforge bin/netforge-scan bin/netforge-http bin/netforge-packets
 .PHONY: all check clean

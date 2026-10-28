@@ -14,7 +14,7 @@ static size_t log_head, log_count;
 static bool console_output;
 void nf_log_emit(int level, const char *source, const char *format, ...)
 {
-    static const char *marks[] = { "i", "+", "!", "x" };
+    static const char *marks[] = { "INFO", "OK", "WARN", "ERROR" };
     char message[200], stamp[16] = "--:--:--";
     struct tm local;
     time_t now = time(NULL);

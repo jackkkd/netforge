@@ -4,6 +4,7 @@
 #include "netforge/scanner.h"
 #include "netforge/http_server.h"
 #include "netforge/packet_parser.h"
+#include "netforge/text.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,24 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 static int checks, failures;
+typedef struct { char text[1024]; size_t used; } Wrapped;
+static void collect_line(const char *text, size_t length, void *context)
+{
+    Wrapped *out = context;
+    if (out->used + length + 2 > sizeof out->text) return;
+    memcpy(out->text + out->used, text, length);
+    out->used += length;
+    out->text[out->used++] = '\n';
+    out->text[out->used] = '\0';
+}
+static bool event_has(const char *first, const char *second)
+{
+    NfLogEntry entries[NF_LOG_CAPACITY];
+    size_t count = nf_log_snapshot(entries, NF_LOG_CAPACITY);
+    for (size_t i = 0; i < count; ++i)
+        if (strstr(entries[i].text, first) && strstr(entries[i].text, second)) return true;
+    return false;
+}
 static void check(bool okay, const char *description)
 {
     ++checks;
@@ -144,6 +163,20 @@ static bool splash_session(const char *program, unsigned height, unsigned width,
 int main(int argc, char **argv)
 {
     if (argc != 2) return 2;
+    Wrapped wrapped = {0};
+    check(nf_text_wrap("alpha beta gamma", 10, collect_line, &wrapped) == 2 &&
+          !strcmp(wrapped.text, "alpha beta\ngamma\n"), "Log wrapping keeps words together");
+    wrapped = (Wrapped){0};
+    check(nf_text_wrap("source\ndestination", 20, collect_line, &wrapped) == 2 &&
+          !strcmp(wrapped.text, "source\ndestination\n"), "Explicit event lines are preserved");
+    wrapped = (Wrapped){0};
+    check(nf_text_wrap("one\n\nthree", 20, collect_line, &wrapped) == 3 &&
+          !strcmp(wrapped.text, "one\n\nthree\n"), "Blank event lines are preserved");
+    wrapped = (Wrapped){0};
+    check(nf_text_wrap("abcdefgh", 3, collect_line, &wrapped) == 3 &&
+          !strcmp(wrapped.text, "abc\ndef\ngh\n"), "Long tokens wrap without losing characters");
+    check(!nf_text_wrap("text", 0, NULL, NULL) && !nf_text_wrap(NULL, 10, NULL, NULL),
+          "Wrapping handles empty bounds safely");
     char tui[1024], scanner[1024], server[1024], packets[1024];
     snprintf(tui, sizeof tui, "%s/netforge", argv[1]);
     snprintf(scanner, sizeof scanner, "%s/netforge-scan", argv[1]);
@@ -183,6 +216,8 @@ int main(int argc, char **argv)
     check(nf_scanner_start(&scan_job, &scan_settings) && completed(&scan_job), "Scanner completes while HTTP runs");
     NfMetrics metrics = nf_job_snapshot(&scan_job);
     check(metrics.checked == 1 && metrics.good == 1, "Scanner recognizes an open TCP port");
+    check(event_has("Target IP: 127.0.0.1 | TCP port:", "State: OPEN | Reason:"),
+          "Scanner events label the target, port, result, and reason");
     unsigned closed_port = 0;
     reserved = reserve_port(&closed_port);
     scan_settings.first_port = scan_settings.last_port = closed_port;
@@ -198,6 +233,10 @@ int main(int argc, char **argv)
     check(nf_packets_start(&packet_job, &packet_settings) && completed(&packet_job), "Finite packet simulation stops automatically");
     metrics = nf_job_snapshot(&packet_job);
     check(metrics.checked == 9 && metrics.good == 6 && metrics.bad == 3, "Valid and malformed packet counts are correct");
+    check(event_has("Protocol: TCP | Source IP:", "Destination port: 443 | IP bytes: 40"),
+          "Packet events label addresses, ports, protocol, and size");
+    check(event_has("[WARN]", "Rejected packet | Reason:"),
+          "Rejected examples have readable severity and reason labels");
     nf_job_stop(&http_job);
     check(completed(&http_job) && atomic_load(&http_job.state) == NF_STOPPED, "HTTP cancellation joins the worker");
     scan_settings.first_port = 1; scan_settings.last_port = 4096;

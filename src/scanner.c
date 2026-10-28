@@ -64,9 +64,9 @@ static void *scan_worker(void *argument)
     NfMetrics metrics = nf_job_snapshot(job);
     bool failed = false;
     atomic_store(&job->state, NF_RUNNING);
-    nf_log_emit(NF_INFO, "SCAN", "TCP connect scan: %u probes, %u ms timeout.",
+    nf_log_emit(NF_INFO, "SCAN", "Starting scan: %u connection checks; wait up to %u ms per port.",
          metrics.total, settings.timeout);
-    nf_log_emit(NF_INFO, "SCAN", "TARGET           PORT/TCP   STATE       REASON");
+    nf_log_emit(NF_INFO, "SCAN", "Each result identifies the target device, TCP port, state, and reason.");
     uint64_t hosts = (uint64_t)settings.last - settings.first + 1U;
     for (uint64_t host = 0; host < hosts && !failed; ++host) {
         uint32_t ip = settings.first + (uint32_t)host;
@@ -98,7 +98,7 @@ static void *scan_worker(void *argument)
                     result == CLOSED_PORT ? "connection refused" :
                     result == NO_REPLY ? "no reply before timeout" : "unreachable/blocked";
                 nf_log_emit(result == OPEN_PORT ? NF_SUCCESS : NF_INFO, "SCAN",
-                     "%-15s %5u/tcp  %-10s %s", text, port, state, reason);
+                     "Target IP: %s | TCP port: %u\nState: %s | Reason: %s", text, port, state, reason);
             }
         }
         if (atomic_load(&job->stop)) break;

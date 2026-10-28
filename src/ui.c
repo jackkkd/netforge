@@ -1,6 +1,7 @@
 #include "netforge/job.h"
 #include "netforge/log.h"
 #include "netforge/util.h"
+#include "netforge/text.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -23,7 +24,9 @@ static NfLogEntry view_logs[NF_LOG_CAPACITY];
 static size_t view_count, scroll_offset;
 static bool logs_paused, colors, verbose_scan, editing;
 static volatile sig_atomic_t interrupted;
-static WINDOW *panel, *activity;
+static WINDOW *header, *panel, *activity;
+static bool expanded;
+static int body_width, body_left, panel_height, layout_page;
 static int rows, cols, header_height, page = HOME, home_choice, field, previous_page = HOME;
 static char notice[160] = "Welcome. Choose a tool below to begin.";
 static char scan_fields[5][32] = {
@@ -37,8 +40,30 @@ static const char *scan_labels[] = {
 };
 static const char *http_labels[] = { "Listen IPv4 address", "Listen TCP port" };
 static const char *packet_labels[] = {
-    "Interval (ms)", "Packet limit (0=continuous)", "Malformed every N (0=off)"
+    "Delay per packet (ms)", "Packets (0 = continuous)", "Invalid every N (0 = off)"
 };
+
+
+static const char *const scan_hints[] = {
+    "The first device address to check; 127.0.0.1 is this VM.",
+    "The last device address; use the same IP for one device.",
+    "Start of the TCP port range (1-65535).",
+    "End of the TCP port range; both endpoints are included.",
+    "Maximum wait for each connection (50-3000 ms)."
+};
+static const char *const http_hints[] = {
+    "127.0.0.1 = this VM; 0.0.0.0 = all IPv4 interfaces.",
+    "Use 8080 for the demo; allowed range is 1024-65535."
+};
+static const char *const packet_hints[] = {
+    "Time between generated examples (100-5000 ms).",
+    "How many examples to generate; 0 runs until stopped.",
+    "Every Nth example is invalid on purpose; 0 disables this."
+};
+static const char *const *field_hints(void)
+{
+    return page == SCAN ? scan_hints : page == HTTP ? http_hints : packet_hints;
+}
 
 static void set_notice(const char *format, ...)
 {
@@ -105,7 +130,11 @@ static void edit_key(int key)
             field = 0; editing = false;
             set_notice("Settings kept. Press Enter to validate and start.");
         }
-    } else if (key == KEY_BTAB) field = (field + count - 1) % count;
+        if (editing) set_notice("%s", field_hints()[field]);
+    } else if (key == KEY_BTAB) {
+        field = (field + count - 1) % count;
+        set_notice("%s", field_hints()[field]);
+    }
     else if (key == 21) text[0] = '\0';
     else if (key == KEY_BACKSPACE || key == 127 || key == '\b') {
         if (length) text[length - 1U] = '\0';
@@ -144,6 +173,7 @@ static void save_log(void)
 /* ---------------------------- Ncurses display --------------------------- */
 static void free_windows(void)
 {
+    if (header) { delwin(header); header = NULL; }
     if (panel) { delwin(panel); panel = NULL; }
     if (activity) { delwin(activity); activity = NULL; }
 }
@@ -154,9 +184,16 @@ static bool layout(void)
     getmaxyx(stdscr, rows, cols);
     if (rows < MIN_ROWS || cols < MIN_COLS) return true;
     header_height = nf_art_header_height(rows);
-    panel = newwin(12, cols, header_height + 2, 0);
-    activity = newwin(rows - header_height - 16, cols, header_height + 14, 0);
-    if (!panel || !activity) { free_windows(); return false; }
+    body_width = cols > 128 ? 128 : cols;
+    body_left = (cols - body_width) / 2;
+    expanded = rows >= 42;
+    panel_height = expanded ? (page == SCAN ? 20 : 18) : 12;
+    layout_page = page;
+    int activity_top = header_height + 2 + panel_height;
+    header = newwin(header_height, body_width, 0, body_left);
+    panel = newwin(panel_height, body_width, header_height + 2, body_left);
+    activity = newwin(rows - activity_top - 2, body_width, activity_top, body_left);
+    if (!header || !panel || !activity) { free_windows(); return false; }
     return true;
 }
 
@@ -170,14 +207,103 @@ static void line(WINDOW *window, int row, const char *format, ...)
     mvwaddnstr(window, row, 2, text, getmaxx(window) - 4);
 }
 
+static void section(int row, const char *title)
+{
+    wattron(panel, A_BOLD);
+    line(panel, row, "%s", title);
+    wattroff(panel, A_BOLD);
+}
+
 static void draw_fields(const char *const *labels, char (*fields)[32], int count)
 {
+    const char *const *hints = field_hints();
+    bool side_help = expanded && body_width >= 112;
+    if (side_help) mvwaddstr(panel, 3, 64, "FIELD HELP");
     for (int i = 0; i < count; ++i) {
+        int row = expanded ? 4 + i * 2 : i + 2;
+        int room = (side_help ? 59 : body_width - 4) - 32;
+        size_t length = strlen(fields[i]);
+        const char *value = length > (size_t)room ? fields[i] + length - (size_t)room : fields[i];
         if (editing && field == i) wattron(panel, A_REVERSE);
-        line(panel, i + 2, "%-27s [%s%s]", labels[i], fields[i],
-             editing && field == i ? "_" : "");
+        line(panel, row, "%-27s [%s%s]", labels[i], value, editing && field == i ? "_" : "");
         if (editing && field == i) wattroff(panel, A_REVERSE);
+        if (side_help) {
+            wattron(panel, A_DIM);
+            mvwaddnstr(panel, row, 64, hints[i], body_width - 66);
+            wattroff(panel, A_DIM);
+        }
     }
+}
+
+static int activity_first_row(void)
+{
+    return getmaxy(activity) >= 11 ? 4 : 2;
+}
+
+static const char *activity_key(void)
+{
+    if (page == PACKETS)
+        return "Source = sender | Destination = receiver | IP bytes = IPv4 packet size";
+    if (page == SCAN)
+        return "OPEN = accepted | CLOSED = refused | UNCERTAIN = no clear answer";
+    if (page == HTTP)
+        return "Client = connecting device | 200 = page sent | 404 = page not found";
+    return "Time | Tool | Level: INFO / OK / WARN / ERROR | Event details";
+}
+
+typedef struct {
+    size_t current, start, end;
+    int first_row;
+    bool continuation;
+} LogPaint;
+
+static void paint_log_line(const char *text, size_t length, void *context)
+{
+    LogPaint *paint = context;
+    if (paint->current >= paint->start && paint->current < paint->end) {
+        int row = paint->first_row + (int)(paint->current - paint->start);
+        mvwaddnstr(activity, row, paint->continuation ? 4 : 2, text, (int)length);
+    }
+    ++paint->current;
+    paint->continuation = true;
+}
+
+static void refresh_log_view(void);
+
+static void draw_activity(void)
+{
+    refresh_log_view();
+    werase(activity); box(activity, 0, 0);
+    mvwprintw(activity, 0, 2, " RECENT ACTIVITY - ALL TOOLS [%s] ", logs_paused ? "PAUSED" : "LIVE");
+    int first_row = activity_first_row();
+    wattron(activity, A_DIM);
+    if (first_row == 4) {
+        line(activity, 1, "Time | Tool | Level: INFO / OK / WARN / ERROR | Event details");
+        line(activity, 2, "%s", activity_key());
+    } else line(activity, 1, "%s", activity_key());
+    wattroff(activity, A_DIM);
+    size_t visible = (size_t)(getmaxy(activity) - first_row - 1);
+    size_t width = (size_t)(body_width - 6), visual_rows = 0;
+    bool spacing = getmaxy(activity) >= 12;
+    for (size_t i = 0; i < view_count; ++i) {
+        visual_rows += nf_text_wrap(view_logs[i].text, width, NULL, NULL);
+        if (spacing && i + 1 < view_count) ++visual_rows;
+    }
+    size_t max_offset = visual_rows > visible ? visual_rows - visible : 0;
+    if (scroll_offset > max_offset) scroll_offset = max_offset;
+    size_t end = visual_rows - scroll_offset;
+    LogPaint paint = { .start = end > visible ? end - visible : 0,
+                       .end = end, .first_row = first_row };
+    for (size_t i = 0; i < view_count && paint.current < end; ++i) {
+        int color = view_logs[i].level == NF_SUCCESS ? 2 : view_logs[i].level == NF_WARNING ? 3 :
+                    view_logs[i].level == NF_FAILURE ? 4 : 1;
+        if (colors) wattron(activity, COLOR_PAIR(color));
+        paint.continuation = false;
+        nf_text_wrap(view_logs[i].text, width, paint_log_line, &paint);
+        if (spacing && i + 1 < view_count) paint_log_line("", 0, &paint);
+        if (colors) wattroff(activity, COLOR_PAIR(color));
+    }
+    wnoutrefresh(activity);
 }
 
 static void refresh_log_view(void)
@@ -190,116 +316,130 @@ static void refresh_log_view(void)
 static void draw(void)
 {
     static const char *titles[] = { "MAIN MENU", "TCP PORT SCANNER", "HTTP WEB SERVER",
-                                  "PACKET HEADER SIMULATION", "HELP / QUICK START" };
+                                  "PACKET STREAM / HEADER PARSER", "HELP / QUICK START" };
     erase();
     if (rows < MIN_ROWS || cols < MIN_COLS) {
         if (rows > 0 && cols > 1)
             mvaddnstr(0, 0, "Please resize to 80x28 or larger. Q quits.", cols - 1);
         refresh(); return;
     }
-    nf_art_draw_header(stdscr, header_height, colors);
-    mvprintw(header_height, 2, "Main menu%s%s", page == HOME ? "" : " > ", page == HOME ? "" : titles[page]);
-    mvaddnstr(header_height + 1, 2, notice, cols - 4);
+    werase(header);
+    nf_art_draw_header(header, header_height, colors);
+    mvprintw(header_height, body_left + 2, "Main menu%s%s", page == HOME ? "" : " > ", page == HOME ? "" : titles[page]);
+    mvaddnstr(header_height + 1, body_left + 2, notice, body_width - 4);
     char bottom[160];
     (void)snprintf(bottom, sizeof bottom, "Scanner: %s | HTTP: %s | Packets: %s | Log: %s",
          nf_job_status(&scan_job), nf_job_status(&http_job), nf_job_status(&packet_job), logs_paused ? "PAUSED" : "LIVE");
-    mvaddnstr(rows - 2, 1, bottom, cols - 2);
-    mvaddnstr(rows - 1, 1, editing ?
+    mvaddnstr(rows - 2, body_left + 1, bottom, body_width - 2);
+    mvaddnstr(rows - 1, body_left + 1, editing ?
         "EDIT: Ctrl-U clear | Backspace delete | Tab/Enter next | Esc done" :
-        "B menu | H help | P pause log | PgUp/PgDn scroll | W save | C clear | Q quit", cols - 2);
+        "B menu | H help | P pause log | PgUp/PgDn scroll | W save | C clear | Q quit", body_width - 2);
     wnoutrefresh(stdscr);
+    wnoutrefresh(header);
     werase(panel); box(panel, 0, 0);
     mvwprintw(panel, 0, 2, " %s ", titles[page]);
+    int controls = panel_height - 2;
     if (page == HOME) {
         static const char *names[] = { "TCP port scanner", "HTTP web server",
-                                       "Packet header simulation", "Help and quick start" };
+                                       "Packet stream and header parser", "Help and quick start" };
         static const char *descriptions[] = {
-            "Find TCP ports accepting connections in an IPv4 range.",
-            "Serve a webpage and see which clients connect.",
-            "Decode IPv4/TCP/UDP headers from generated examples.",
-            "Learn the controls and run a localhost demonstration."
+            "Check which TCP ports accept connections on selected devices.",
+            "Host a webpage inside Kali and see who connects to it.",
+            "Learn packet fields with simulated IPv4, TCP, and UDP examples.",
+            "Follow a step-by-step demo and learn the keyboard controls."
         };
-        line(panel, 1, "Choose a tool. Review its settings, then press Enter to start it.");
+        line(panel, 1, "Choose a tool, review its settings, then press Enter to start.");
         for (int i = 0; i < 4; ++i) {
+            int row = expanded ? 3 + i * 3 : 2 + i * 2;
             if (home_choice == i) wattron(panel, A_REVERSE);
-            line(panel, 2 + i * 2, "%s [%d] %s", home_choice == i ? ">" : " ", i + 1, names[i]);
+            line(panel, row, "%s [%d] %s", home_choice == i ? ">" : " ", i + 1, names[i]);
             if (home_choice == i) wattroff(panel, A_REVERSE);
-            line(panel, 3 + i * 2, "      %s", descriptions[i]);
+            line(panel, row + 1, "      %s", descriptions[i]);
         }
-        line(panel, 10, "Up/Down: choose | Enter: open | 1-4: open directly | Q: exit");
+        line(panel, controls, "Up/Down: choose | Enter: open | 1-4: open directly | Q: quit");
     } else if (page == SCAN) {
-        NfMetrics metrics = nf_job_snapshot(&scan_job);
-        line(panel, 1, "TCP connect scan | Only scan systems you are authorized to test.");
+        NfMetrics m = nf_job_snapshot(&scan_job);
+        line(panel, 1, "Check TCP ports on IPv4 devices you are allowed to test.");
+        if (expanded) {
+            line(panel, 2, "Both address and port ranges include their first and last values.");
+            section(3, "SCAN SETTINGS");
+        }
         draw_fields(scan_labels, scan_fields, 5);
-        unsigned percent = metrics.total ? (unsigned)((uint64_t)metrics.checked * 100U / metrics.total) : 0;
+        unsigned percent = m.total ? (unsigned)((uint64_t)m.checked * 100U / m.total) : 0;
         char bar[21];
         for (int i = 0; i < 20; ++i) bar[i] = i < (int)(percent / 5U) ? '#' : '-';
         bar[20] = '\0';
-        line(panel, 7, "[%s] %3u%% | Checked: %u/%u", bar, percent, metrics.checked, metrics.total);
-        line(panel, 8, "Open: %u | Closed/refused: %u | Uncertain: %u", metrics.good, metrics.bad, metrics.other);
-        line(panel, 9, "Result detail: %s | No reply is inconclusive.", verbose_scan ? "ALL PORTS" : "OPEN PORTS + SUMMARY");
-        line(panel, 10, "Enter/Space: %s | E: edit | V: detail | B: menu", scan_job.live ? "stop scan" : "start scan");
+        line(panel, expanded ? 14 : 7, "Progress [%s] %3u%% | Connections checked: %u/%u", bar, percent, m.checked, m.total);
+        line(panel, expanded ? 15 : 8, "Open: %u | Closed/refused: %u | Uncertain: %u", m.good, m.bad, m.other);
+        if (expanded) line(panel, 16, "OPEN = connected | CLOSED = refused | UNCERTAIN = timeout or unreachable");
+        line(panel, expanded ? 17 : 9, "Log detail: %s. V changes this before a scan.", verbose_scan ? "all checked ports" : "open ports and summary");
+        line(panel, controls, "Enter/Space: %s | E: edit | V: result detail | B: menu", scan_job.live ? "stop scan" : "start scan");
     } else if (page == HTTP) {
-        NfMetrics metrics = nf_job_snapshot(&http_job);
-        line(panel, 1, "Serve a static webpage. State: %s", nf_job_status(&http_job));
+        NfMetrics m = nf_job_snapshot(&http_job);
+        bool listening = atomic_load(&http_job.state) == NF_RUNNING && !atomic_load(&http_job.stop);
+        const char *host = !strcmp(http_fields[0], "0.0.0.0") ? "127.0.0.1" : http_fields[0];
+        line(panel, 1, "Host a simple webpage and see the devices connecting to it.");
+        if (expanded) {
+            line(panel, 2, "Server status: %s", nf_job_status(&http_job));
+            section(3, "SERVER SETTINGS");
+        }
         draw_fields(http_labels, http_fields, 2);
-        line(panel, 4, "127.0.0.1 = Kali only; 0.0.0.0 = all IPv4 interfaces.");
-        line(panel, 5, "Clients: %u | Completed 200 responses: %u | Other/incomplete: %u",
-             metrics.checked, metrics.good, metrics.bad);
-        line(panel, 6, "Page: ./index.html if present; otherwise the built-in page.");
-        line(panel, 7, "Inside Kali: curl -i http://%s:%s/",
-             !strcmp(http_fields[0], "0.0.0.0") ? "127.0.0.1" : http_fields[0], http_fields[1]);
-        line(panel, 8, "From the VM host: use Kali's IPv4 address and a reachable VM network.");
-        line(panel, 9, "GET/HEAD supported. Stop and restart to reload index.html.");
-        line(panel, 10, "Enter/Space: %s | E: edit | B: menu", http_job.live ? "stop server" : "start server");
+        if (expanded) section(9, "CONNECTION SUMMARY");
+        line(panel, expanded ? 10 : 5, "Clients: %u | Responses (200): %u | Other/incomplete: %u", m.checked, m.good, m.bad);
+        if (expanded) section(12, "OPEN IN YOUR KALI BROWSER");
+        line(panel, expanded ? 13 : 7, "URL: http://%s:%s/", host, http_fields[1]);
+        if (colors) wattron(panel, COLOR_PAIR(listening ? 2 : 3));
+        line(panel, expanded ? 14 : 8, "%s", listening ? "Server is running. You can open the URL now." :
+             "Start the server with Enter; wait for Running before opening the URL.");
+        if (colors) wattroff(panel, COLOR_PAIR(listening ? 2 : 3));
+        line(panel, expanded ? 15 : 6, "Page: ./index.html if present; otherwise the built-in welcome page.");
+        if (!expanded) {
+            line(panel, 4, "127.0.0.1 = this VM | 0.0.0.0 = all IPv4 interfaces");
+            line(panel, 9, "Stop/restart after editing index.html. Clients are logged below.");
+        }
+        line(panel, controls, "Enter/Space: %s | E: edit | B: menu", http_job.live ? "stop server" : "start server");
     } else if (page == PACKETS) {
-        NfMetrics metrics = nf_job_snapshot(&packet_job);
-        line(panel, 1, "SIMULATED packets: no live capture, no transmitted traffic.");
+        NfMetrics m = nf_job_snapshot(&packet_job);
+        line(panel, 1, "SIMULATED packets: learn to read IPv4, TCP, and UDP headers.");
+        if (expanded) {
+            line(panel, 2, "Runs locally. No live traffic is captured or transmitted.");
+            section(3, "SIMULATION SETTINGS");
+        }
         draw_fields(packet_labels, packet_fields, 3);
-        line(panel, 5, "Samples: %u | Decoded: %u | Rejected: %u", metrics.checked, metrics.good, metrics.bad);
-        line(panel, 6, "Shows protocol, source/destination IPv4 addresses, and ports.");
-        line(panel, 7, "Checks lengths and IPv4 checksums; rejects fragments.");
-        line(panel, 8, "Transport checksums and fragment reassembly are not implemented.");
-        line(panel, 9, "Malformed examples are intentional learning samples.");
-        line(panel, 10, "Enter/Space: %s | E: edit | B: menu", packet_job.live ? "stop simulation" : "start simulation");
+        if (expanded) section(11, "PARSER RESULTS");
+        line(panel, expanded ? 12 : 6, "Generated: %u | Parsed: %u | Rejected: %u", m.checked, m.good, m.bad);
+        line(panel, expanded ? 13 : 7, "Parsed = valid headers. Rejected = invalid or incomplete headers.");
+        if (expanded) line(panel, 15, "Source = sender | Destination = receiver | Ports = app endpoints");
+        else {
+            line(panel, 8, "Source = sender | Destination = receiver | Ports = app endpoints");
+            line(panel, 9, "Invalid examples are intentional. No real traffic is involved.");
+        }
+        line(panel, controls, "Enter/Space: %s | E: edit | B: menu", packet_job.live ? "stop simulation" : "start simulation");
     } else {
-        line(panel, 1, "QUICK DEMONSTRATION");
-        line(panel, 2, "1. Main menu > HTTP server > Enter to start the server.");
-        line(panel, 3, "2. Open http://127.0.0.1:8080 in Firefox inside Kali.");
-        line(panel, 4, "3. B > TCP scanner > Enter: default range includes port 8080.");
-        line(panel, 5, "4. B > Packet simulation > Enter: inspect decoded headers.");
-        line(panel, 6, "E edits settings. Ctrl-U clears a field. Tab moves forward.");
-        line(panel, 7, "Returning to the menu keeps running tools active.");
-        line(panel, 8, "W saves the latest 512 log entries in the current directory.");
-        line(panel, 9, "P pauses/resumes the log. Q stops all workers and exits.");
-        line(panel, 10, "B/Esc: main menu | H: return to the previous screen");
+        section(1, "QUICK DEMONSTRATION");
+        if (expanded) {
+            line(panel, 2, "Current HTTP state: %s (the page requires Running).", nf_job_status(&http_job));
+            section(4, "1. START THE WEB SERVER");
+            line(panel, 5, "Press B -> 2 -> Enter; wait for HTTP: Running at the bottom.");
+            section(7, "2. OPEN ITS PAGE INSIDE KALI");
+            line(panel, 8, "In Firefox: http://%s:%s/", !strcmp(http_fields[0], "0.0.0.0") ? "127.0.0.1" : http_fields[0], http_fields[1]);
+            section(10, "3. SCAN THE LOCAL TCP PORTS");
+            line(panel, 11, "Press B -> 1 -> Enter. Defaults include localhost port 8080.");
+            section(13, "4. READ EXAMPLE PACKET HEADERS");
+            line(panel, 14, "Press B -> 3 -> Enter. Read the labeled packet events below.");
+            line(panel, 15, "E: edit | P: pause log | W: save | Q: stop tools and quit");
+        } else {
+            line(panel, 2, "1. B -> 2 -> Enter: start HTTP; wait for HTTP: Running.");
+            line(panel, 3, "2. In Kali Firefox: http://%s:%s/", !strcmp(http_fields[0], "0.0.0.0") ? "127.0.0.1" : http_fields[0], http_fields[1]);
+            line(panel, 5, "3. B -> 1 -> Enter: scan localhost (includes TCP port 8080).");
+            line(panel, 6, "4. B -> 3 -> Enter: read labeled simulated packet headers.");
+            line(panel, 8, "E: edit | Ctrl-U: clear field | Tab: next field");
+            line(panel, 9, "P: pause log | W: save recent events | Q: stop all and quit");
+        }
+        line(panel, controls, "B/Esc: main menu | H: return to the previous screen");
     }
     wnoutrefresh(panel);
-    refresh_log_view();
-    werase(activity); box(activity, 0, 0);
-    mvwprintw(activity, 0, 2, " RECENT ACTIVITY [%s] ", logs_paused ? "PAUSED" : "LIVE");
-    size_t visible = (size_t)(getmaxy(activity) - 2);
-    size_t width = (size_t)(cols - 4), visual_rows = 0;
-    for (size_t i = 0; i < view_count; ++i)
-        visual_rows += (strlen(view_logs[i].text) + width - 1U) / width;
-    size_t max_offset = visual_rows > visible ? visual_rows - visible : 0;
-    if (scroll_offset > max_offset) scroll_offset = max_offset;
-    size_t end = visual_rows - scroll_offset;
-    size_t start = end > visible ? end - visible : 0;
-    size_t visual_row = 0;
-    for (size_t i = 0; i < view_count && visual_row < end; ++i) {
-        int color = view_logs[i].level == NF_SUCCESS ? 2 : view_logs[i].level == NF_WARNING ? 3 :
-                    view_logs[i].level == NF_FAILURE ? 4 : 1;
-        if (colors) wattron(activity, COLOR_PAIR(color));
-        size_t length = strlen(view_logs[i].text);
-        for (size_t offset = 0; offset < length && visual_row < end; offset += width, ++visual_row) {
-            if (visual_row >= start)
-                mvwaddnstr(activity, (int)(visual_row - start) + 1, 2,
-                          view_logs[i].text + offset, (int)width);
-        }
-        if (colors) wattroff(activity, COLOR_PAIR(color));
-    }
-    wnoutrefresh(activity);
+    draw_activity();
     doupdate();
 }
 
@@ -324,7 +464,7 @@ static void key_action(int key, bool *quit)
     if (key == 'p' || key == 'P') { logs_paused = !logs_paused; scroll_offset = 0; return; }
     if (key == KEY_PPAGE || key == KEY_NPAGE) {
         logs_paused = true;
-        size_t step = (size_t)(getmaxy(activity) - 2);
+        size_t step = (size_t)(getmaxy(activity) - activity_first_row() - 1);
         if (key == KEY_PPAGE) scroll_offset += step;
         else if (scroll_offset > step) scroll_offset -= step;
         else { scroll_offset = 0; logs_paused = false; }
@@ -351,7 +491,7 @@ static void key_action(int key, bool *quit)
     if (key == '\n' || key == '\r' || key == KEY_ENTER || key == ' ') start_selected();
     else if (key == 'e' || key == 'E') {
         if (job->live) set_notice("Stop this tool with Enter before editing its settings.");
-        else { editing = true; field = 0; set_notice("Ctrl-U clears a field. Tab advances. Esc keeps edits and leaves editing."); }
+        else { editing = true; field = 0; set_notice("%s", field_hints()[field]); }
     } else if (page == SCAN && (key == 'v' || key == 'V')) {
         if (job->live) set_notice("Stop the scan before changing result detail.");
         else { verbose_scan = !verbose_scan; set_notice("Result detail changed for the next scan."); }
@@ -409,10 +549,15 @@ int nf_ui_run(bool skip_splash)
     nf_log_emit(NF_INFO, "SYSTEM", "Welcome to NETFORGE. Choose a tool; nothing starts automatically.");
     nf_log_emit(NF_INFO, "SYSTEM", "For a guided demonstration, open Help from the main menu.");
     while (!quit && !interrupted && !window_error) {
-        for (size_t i = 0; i < 3; ++i) if (!nf_job_reap(jobs[i])) interrupted = 1;
+        for (size_t i = 0; i < 3; ++i) {
+            bool was_live = jobs[i]->live;
+            if (!nf_job_reap(jobs[i])) interrupted = 1;
+            if (was_live && !jobs[i]->live && selected_job() == jobs[i] && !editing)
+                set_notice("%s: %s. Review the activity below; Enter starts another run.", jobs[i]->name, nf_job_status(jobs[i]));
+        }
         int current_rows, current_cols;
         getmaxyx(stdscr, current_rows, current_cols);
-        if (current_rows != rows || current_cols != cols) {
+        if (current_rows != rows || current_cols != cols || page != layout_page) {
             if (!layout()) { window_error = true; result = EXIT_FAILURE; break; }
         }
         draw();
